@@ -1,0 +1,44 @@
+#VAB test template
+
+#trial structure
+
+trial {
+	trial_duration = forever;
+	trial_type = specific_response;
+	terminator_button = 2;
+
+	picture {
+		text {
+			caption = "Please listen to the sound... ";
+			width = 1000;
+			height = 750;
+		};
+	x = 0; y = 0;
+	};
+	time = 0;
+	duration = 2000;
+	
+	sound $soundfile;
+	deltat = 2000;
+	duration = 500;
+	
+	picture {
+		bitmap { filename = "Im34crop.bmp"; width = 161; height = 187; }; 
+		x = -200; y = 100;
+		bitmap { filename = "Im30crop.bmp"; width = 205; height = 185; }; 
+		x = 200; y = 100;
+		bitmap { filename = "Im32crop.bmp"; width = 207; height = 182; }; 
+		x = 0; y = 300;
+		bitmap { filename = "Im35crop.bmp"; width = 255; height = 187; }; 
+		x = 0; y = -100;
+		text {
+			caption = "Which image was the sound paired with? ";
+			width = 900;
+			height = 90;
+		};
+		x = 0; y = -300;
+	};
+	deltat = 500;
+
+};
+

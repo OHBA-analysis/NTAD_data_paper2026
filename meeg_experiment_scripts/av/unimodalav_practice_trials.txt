@@ -1,0 +1,10 @@
+2082	dot	"aonly"	44	t1200	1782	300	;
+2109	dot	"aonly"	44	t1200	1809	300	;
+2000	dot	"filler"	55	silence	1700	300	;
+3000	grating	"vonly"	44	silence	2700	300	;
+2247	dot	"aonly"	44	t600	1947	300	;
+2000	dot	"filler"	55	silence	1700	300	;
+3000	grating	"vonly"	44	silence	2700	300	;
+2183	grating	"vonly"	44	silence	2149	300	;
+2000	dot	"filler"	55	silence	1700	300	;
+1563	dot	"aonly"	44	t300	1263	300	;

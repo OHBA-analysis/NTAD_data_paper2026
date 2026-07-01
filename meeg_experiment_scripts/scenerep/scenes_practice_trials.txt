@@ -1,0 +1,12 @@
+	1223	"pscene1.jpg"	"practice"	44	123	;
+	1199	"pscene2.jpg"	"practice"	44	99	;
+	1274	"pscene3.jpg"	"practice"	44	174	;
+	1132	"pspace1.jpg"	"practice"	44	32	;
+	1140	"pscene4.jpg"	"practice"	44	40	;
+	1122	"pscene5.jpg"	"practice"	44	22	;
+	1275	"pscene6.jpg"	"practice"	44	175	;
+	1134	"pscene7.jpg"	"practice"	44	34	;
+	1252	"pspace2.jpg"	"practice"	44	152	;
+	1192	"pscene8.jpg"	"practice"	44	92	;
+	1270	"pscene9.jpg"	"practice"	44	170	;
+	1191	"pscene10.jpg"	"practice"	44	91	;

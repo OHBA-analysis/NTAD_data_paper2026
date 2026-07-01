@@ -1,0 +1,47 @@
+#Scenes template
+
+#trial structure
+
+trial {
+	trial_duration = $trdur;
+   trial_type = fixed;
+   all_responses = false;
+
+	picture {
+		text {
+			caption = "+";
+			background_color = 200,200,200;
+			font_color = 0,0,0;
+			width = 700;
+			height = 600;
+		};
+	x = 0; y = 0;
+	};
+	time = 0;
+	duration = 300;
+
+	picture {
+		background_color = 200,200,200;
+		bitmap { filename = $picfile; preload = false; width = 1000; height = 750; }; 
+		x = 0; y = 0;
+	};
+	time = 300;
+	code = $condition;
+	duration = 800;
+	port_code = $trigger;
+
+	picture {
+		text {
+			caption = "+";
+			background_color = 200,200,200;
+			font_color = 0,0,0;
+			width = 700;
+			height = 600;
+		};
+	x = 0; y = 0;
+	};
+	time = 1100;
+	duration = $jitter;
+};
+
+

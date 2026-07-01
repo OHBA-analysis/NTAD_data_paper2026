@@ -1,0 +1,5 @@
+sound { 
+		wavefile { filename = "TestSound.wav"; };
+		pan = $ear;
+		attenuation = $db;
+	};

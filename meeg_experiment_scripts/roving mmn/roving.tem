@@ -1,0 +1,13 @@
+#Roving template
+
+#deviant
+
+nothing {};
+deltat = 0;
+
+sound $soundfile;
+deltat = 500;
+duration= 100;
+code = $condition;
+port_code = $trigger;
+

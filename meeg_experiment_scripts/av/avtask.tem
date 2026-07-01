@@ -1,0 +1,26 @@
+#AV task template
+
+#trial structure
+
+trial {
+	trial_duration = $trdur;
+   trial_type = fixed;
+   all_responses = false;
+
+	picture $picfile;
+	time = 0;
+	code = $condition;
+	duration = $picdur; # rather than 34
+	port_code = $trigger;
+	
+	sound $soundfile;
+	time = 0;
+	duration = $picdur;
+	
+	picture dot;
+	time = $picdur;
+	duration = $crossdur;
+
+};
+
+

@@ -1,0 +1,9 @@
+	1191	cross	"aonly"	44	t1200	1157	;
+	1789	board	"audiovis"	44	t300	1755	;
+	1364	board	"audiovis"	44	t600	1330	;
+	1628	board	"vonly"	44	silence	1594	;
+	1354	board	"audiovis"	44	t600	1320	;
+	1143	cross	"aonly"	44	t1200	1109	;
+	1993	board	"vonly"	44	silence	1959	;
+	1437	board	"audiovis"	44	t1200	1403	;
+	1189	board	"audiovis"	44	t1200	1155	;

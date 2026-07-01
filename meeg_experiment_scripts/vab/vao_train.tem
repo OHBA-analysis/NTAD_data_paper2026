@@ -1,0 +1,31 @@
+#VAB template
+
+#trial structure
+
+trial {
+	trial_duration = $trdur;
+   trial_type = fixed;
+   all_responses = false;
+
+	picture $picfile;
+	time = 0;
+	code = $condition;
+	duration = 700;
+	port_code = $trigger;
+	
+	sound $soundfile;
+	deltat = 300;
+	duration = 400;
+	port_code = $soundtrigger;
+	
+	picture {
+		text {
+			caption = " ";
+		};
+	x = 0; y = 0;
+	};
+	deltat = 400;
+	duration = $crossdur;
+};
+
+
