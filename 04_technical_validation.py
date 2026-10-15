@@ -7,6 +7,7 @@ Results are cached to a pickle so plotting can be re-run independently.
 """
 
 import os
+import re
 import csv
 import pickle
 import numpy as np
@@ -31,20 +32,84 @@ MASK      = 4352   # 256 | 4096
 MASK_TYPE = 'not_and'
 N_JOBS    = 12
 PSD_STANDARDISE = False
-PSD_AX = 0.5  # sqrt(f) axis for PSD plot (1.0 = linear, 0.5 = sqrt, 2.0 = f²)
+PSD_AX = 1.0  # sqrt(f) axis for PSD plot (1.0 = linear, 0.5 = sqrt, 2.0 = f²)
 
 # ── per-subject helpers ───────────────────────────────────────────────────────
 df=pd.read_csv('/ohba/pi/mwoolrich/datasets/ntad/DataPortalIngest_March2025/ParticipantOverview.csv')
 ntad_ids = list(df[df['analyseable_using_NTAD_criteria']=='Yes']['NTAD_ID'].unique())
 
+# Site/scanner are NOT derivable from the ID prefix (C/P encode
+# Control/Patient group, not acquisition site).
+_meta_df = pd.read_csv(
+    '/ohba/pi/mwoolrich/datasets/ntad/DataPortalIngest_March2025/MEG_metadata.csv',
+    encoding='latin1')
+
+# Scanner per recording, keyed by (NTAD_ID, visit code in the filename).
+# Cambridge replaced its Elekta Neuromag (Vectorview) with an Elekta Triux Neo
+# in Aug 2020, so a subject's site does not determine the scanner.
+_VISIT_CODE = {'Baseline': 'bl', 'Baseline2': 'bl2', 'Two-week': 'tw',
+               'Annual follow-up': 'af', 'Annual': 'af',
+               'Annual follow-up2': 'af2'}
+SCANNER_MAP = {(r.NTAD_ID, _VISIT_CODE[r.VISIT_ID]): r.SCANNER
+               for r in _meta_df.itertuples()}
+
+# Trigger→stimulus delays (s), measured in trigger_delay_measurements/: the
+# STI101 trigger fires this much *before* the stimulus actually appears, so
+# evoked responses must be shifted earlier by this amount to be correctly
+# zero-aligned on stimulus onset rather than trigger onset.
+# The Cambridge measurements date from May 2021, i.e. the Triux Neo. The
+# Vectorview-era visual delay was longer: MEG_metadata.csv lists 35 vs 20 ms
+# visual (26 vs 26 ms auditory) for the old vs new Cambridge setups, and the
+# scanner-change validation data (05_scanner_validation.py) show the same
+# ~15-20 ms earlier visual responses on the new system. Vectorview delays are
+# therefore the measured Triux Neo delays plus that metadata offset.
+_CAM_OLD_MINUS_NEW = {'auditory': 0.026 - 0.026, 'visual': 0.035 - 0.020}
+DELAYS_S = {
+    ('MEGIN TriuxNeo',   'auditory'): 0.0685,   # Oxford
+    ('MEGIN TriuxNeo',   'visual'):   0.0100,
+    ('Elekta Triux Neo', 'auditory'): 0.0670,   # Cambridge, from Aug 2020
+    ('Elekta Triux Neo', 'visual'):   0.0120,
+    ('Elekta Neuromag',  'auditory'): 0.0670 + _CAM_OLD_MINUS_NEW['auditory'],
+    ('Elekta Neuromag',  'visual'):   0.0120 + _CAM_OLD_MINUS_NEW['visual'],
+}
+
+# On the Cambridge Triux Neo one trigger bit chatters on/off every ~2-6 ms
+# within each ~20-50 ms pulse (22↔30, 33↔35, 44↔60, ...), so find_events
+# assigns the wrong code to about half of the triggers. Triggers are therefore
+# decoded pulse by pulse: a bit belongs to the code if it is high for at least
+# this fraction of the pulse.
+BIT_ON_FRAC = 0.75
+# Extra tmax padding requested during epoching so the shift below (a forward
+# resample) never has to extrapolate past the end of the epoched data.
+_DELAY_PAD_S = 0.1
+
+
+def _decode_sti(raw):
+    """Decode STI101 pulse by pulse, robust to chattering trigger bits.
+
+    Equivalent to find_events(mask=MASK, mask_type=MASK_TYPE, uint_cast=True)
+    on clean recordings; see BIT_ON_FRAC for why it is needed.
+    """
+    sti = raw.get_data(picks='STI101')[0]
+    sti = sti.astype(np.int64).astype(np.uint16).astype(np.int64)  # uint_cast
+    sti &= ~MASK
+    edges = np.diff(np.r_[0, (sti > 0).astype(int), 0])
+    starts, stops = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+    events = []
+    for a, b in zip(starts, stops):
+        seg = sti[a:b]
+        code = sum(1 << k for k in range(16)
+                   if ((seg >> k) & 1).mean() >= BIT_ON_FRAC)
+        if code:
+            events.append([a + raw.first_samp, 0, code])
+    return np.array(events, dtype=int).reshape(-1, 3)
+
 
 def _get_events(raw, event_id):
     """Get events from STI channel, falling back to annotations."""
-    try:
-        return mne.find_events(raw, shortest_event=1, mask=MASK,
-                               mask_type=MASK_TYPE, uint_cast=True,
-                               verbose=False)
-    except ValueError:
+    if 'STI101' in raw.ch_names:
+        return _decode_sti(raw)
+    else:
         # No STI channel – events were saved as annotations.
         # Try matching annotation descriptions to numeric event codes.
         ev_id_str = {str(v): v for v in set(event_id.values())}
@@ -53,9 +118,30 @@ def _get_events(raw, event_id):
         return events
 
 
+def _shift_evoked(evoked, delay_s):
+    """Shift an Evoked's timeline earlier by delay_s (trigger→stimulus lag).
+
+    Resamples each channel at times+delay_s but keeps the *same* nominal
+    time axis, so every subject/site ends up on an identical time grid —
+    required for later grand-averaging across subjects (mne.grand_average
+    requires exact time-axis matches).
+    """
+    times = evoked.times
+    src_times = times + delay_s
+    evoked.data = np.array([np.interp(src_times, times, ch) for ch in evoked.data])
+    return evoked
+
+
 def compute_evoked_sub(fif_path, event_id, tmin, tmax,
-                       l_freq=0.5, h_freq=30.0, recode=None):
-    """Return per-condition Evoked objects for one subject."""
+                       l_freq=0.5, h_freq=30.0, recode=None, modality=None):
+    """Return per-condition Evoked objects for one subject.
+
+    modality: optional {condition_label: 'auditory'|'visual'}. If given,
+    each condition's evoked is corrected for the measured trigger→stimulus
+    delay (see trigger_delay_measurements/), which is site- and
+    modality-specific. Epochs are extracted with extra tmax padding so the
+    correction never has to extrapolate past the epoched data.
+    """
     try:
         # Load full raw (keep STI channel) so _get_events can use it.
         raw = mne.io.read_raw_fif(fif_path, preload=True, verbose=False)
@@ -66,14 +152,22 @@ def compute_evoked_sub(fif_path, event_id, tmin, tmax,
             # recode: {new_int: [list of old ints]}
             for new_code, old_codes in recode.items():
                 events[np.isin(events[:, 2], old_codes), 2] = new_code
+        epoch_tmax = tmax + _DELAY_PAD_S if modality else tmax
         epochs = mne.Epochs(raw, events, event_id=event_id,
-                            tmin=tmin, tmax=tmax, baseline=(None, 0),
+                            tmin=tmin, tmax=epoch_tmax, baseline=(None, 0),
                             preload=True, verbose=False,
                             reject_by_annotation=True)
+        scanner = SCANNER_MAP.get(_recording_key(fif_path)) if modality else None
         out = {}
         for cond in event_id:
             if cond in epochs.event_id and len(epochs[cond]) > 0:
-                out[cond] = epochs[cond].average()
+                evoked = epochs[cond].average()
+                mod = modality.get(cond) if modality else None
+                if mod and scanner and (scanner, mod) in DELAYS_S:
+                    evoked = _shift_evoked(evoked, DELAYS_S[(scanner, mod)])
+                if modality:
+                    evoked.crop(tmin, tmax)
+                out[cond] = evoked
         return out
     except Exception as e:
         print(f'  skip {os.path.basename(fif_path)}: {type(e).__name__}: {e}')
@@ -117,6 +211,15 @@ def _subject_id(fif_path):
     return os.path.basename(fif_path).split('_')[0]
 
 
+_REC_RE = re.compile(r'^([A-Z]\d+)_.+_(bl2?|tw|af2?)_tsss_preproc_raw\.fif$')
+
+
+def _recording_key(fif_path):
+    """(NTAD_ID, visit code) from a preprocessed fif path, for SCANNER_MAP."""
+    m = _REC_RE.match(os.path.basename(fif_path))
+    return m.groups() if m else None
+
+
 _ntad_ids_set = set(ntad_ids)
 
 
@@ -131,10 +234,11 @@ def gfp(evoked):
     return np.sqrt(np.mean(evoked.data ** 2, axis=0)) * 1e15
 
 
-def process_task(files, event_id, tmin, tmax, recode=None):
+def process_task(files, event_id, tmin, tmax, recode=None, modality=None):
     """Return per-subject GFP arrays and evoked objects keyed by condition."""
     sub_evos = Parallel(n_jobs=N_JOBS, verbose=0)(
-        delayed(compute_evoked_sub)(f, event_id, tmin, tmax, recode=recode)
+        delayed(compute_evoked_sub)(f, event_id, tmin, tmax, recode=recode,
+                                    modality=modality)
         for f in files)
     sub_ids = [_subject_id(f) for f in files]
 
@@ -253,20 +357,23 @@ def _session_specs():
          lambda: process_task(
              sorted(glob(f'{BASE}/1/tsss/*/*_preproc_raw.fif')),
              event_id={'Auditory': 22, 'Visual': 33},
-             tmin=-0.2, tmax=0.5)),
+             tmin=-0.2, tmax=0.5,
+             modality={'Auditory': 'auditory', 'Visual': 'visual'})),
         ('t2', 'Task 2 – Mismatch Negativity',
          lambda: process_task(
              sorted(glob(f'{BASE}/2/tsss/*/*_preproc_raw.fif')),
              # Events: 100 = Deviant; 101-110 = Repetitions, recoded → 101
              event_id={'Deviant': 100, 'Standard': 101},
              tmin=-0.2, tmax=0.5,
-             recode={101: list(range(101, 111))})),
+             recode={101: list(range(101, 111))},
+             modality={'Deviant': 'auditory', 'Standard': 'auditory'})),
         ('t3', 'Task 3 – Scene Repetition',
          lambda: process_task(
              sorted(glob(f'{BASE}/3/tsss/*/*_preproc_raw.fif')),
              # Events: 22 = Novel (first presentation), 33 = Familiar (repeated)
              event_id={'Novel': 22, 'Familiar': 33},
-             tmin=-0.2, tmax=0.7)),
+             tmin=-0.2, tmax=0.7,
+             modality={'Novel': 'visual', 'Familiar': 'visual'})),
         ('t4', 'Task 4 – Visual-Auditory Oddball',
          lambda: process_task(
              sorted(glob(f'{BASE}/4/tsss/*vao_task*/*_preproc_raw.fif')),
@@ -274,7 +381,11 @@ def _session_specs():
              # auditory response 330–700 ms (audio fires 330 ms after visual).
              # Visual triggers: 10 = STD, 20 = AD, 30 = ND
              event_id={'Standard': 10, 'Aud. deviant': 20, 'Novel deviant': 30},
-             tmin=-0.2, tmax=0.8)),
+             tmin=-0.2, tmax=0.8,
+             # Epoch is anchored to the visual trigger, so it is the visual
+             # delay that must be corrected for.
+             modality={'Standard': 'visual', 'Aud. deviant': 'visual',
+                       'Novel deviant': 'visual'})),
         ('rso', 'Resting – Eyes Open',
          lambda: process_psd(
              sorted(glob(f'{BASE}/5/tsss/*/*_preproc_raw.fif')))),
@@ -356,20 +467,25 @@ _DIFF_STYLES = ['--', ':']
 
 
 def plot_task_panel(ax, task_res, title, panel_label,
-                    diff_pairs=None, vline_330=False, legend_loc='upper right'):
-    """Plot GFP mean ± SEM; diff waves on right y-axis with independent scaling."""
+                    diff_pairs=None, vline_330=False, legend_loc='upper right',
+                    legend_labels=None):
+    """Plot GFP mean ± SEM; diff waves on right y-axis with independent scaling.
+
+    legend_labels: optional {condition: display name} override for the legend
+    text (defaults to the condition key itself).
+    """
     for cond, d in task_res.items():
         t     = d['times'] * 1000
         color = PALETTE.get(cond, 'gray')
+        disp  = legend_labels.get(cond, cond) if legend_labels else cond
         ax.plot(t, d['gfp_mean'], color=color, lw=1.5,
-                label=f"{cond} (n={d['n']})")
+                label=f"{disp} (n={d['n']})")
         ax.fill_between(t,
                         d['gfp_mean'] - d['gfp_sem'],
                         d['gfp_mean'] + d['gfp_sem'],
                         alpha=0.2, color=color)
 
     ax.axvline(0, color='k', lw=0.8, ls='--', alpha=0.4)
-
     main_lines, main_labels = ax.get_legend_handles_labels()
     diff_lines, diff_labels = [], []
 
@@ -412,8 +528,10 @@ def plot_task_panel(ax, task_res, title, panel_label,
         ymin, ymax = ax.get_ylim()
         pad = (ymax - ymin) * 0.18
         ax.set_ylim(ymin, ymax + pad)
-        ax.text(335, ymax + pad * 0.45, 'aud. onset',
+        ax.text(335, ymax + pad * 0.45, 'auditory onset',
                 ha='left', va='center', fontsize=6.5, color='dimgray')
+        ax.text(5, ymax + pad * 0.45, 'visual onset',
+                            ha='left', va='center', fontsize=6.5, color='dimgray')
 
     ax.set_title(title, fontweight='bold', fontsize=10)
     ax.set_xlabel('Time (ms)', fontsize=9)
@@ -424,9 +542,17 @@ def plot_task_panel(ax, task_res, title, panel_label,
             fontsize=12, fontweight='bold', va='bottom', ha='right')
 
 
-def make_figure(res):
-    # Aggregate to valid subjects only — cheap, no recomputation needed
-    agg = {
+AGG_PKL = f'{OUT}/figure_data.pkl'
+
+
+def compute_agg(res):
+    """Aggregate per-subject session results to the group-level data actually
+    plotted in the figure. Cheap relative to compute_evoked_sub/compute_psd_sub,
+    but still touches every subject's Evoked objects — cached separately (see
+    AGG_PKL) so cosmetic-only figure tweaks don't need to reload/re-aggregate
+    the (much larger) per-subject pkls.
+    """
+    return {
         't1':  _agg_task(res['t1'],  _ntad_ids_set),
         't2':  _agg_task(res['t2'],  _ntad_ids_set),
         't3':  _agg_task(res['t3'],  _ntad_ids_set),
@@ -435,14 +561,16 @@ def make_figure(res):
         'rsc': _agg_psd(res['rsc'],  _ntad_ids_set),
     }
 
-    fig = plt.figure(figsize=(14, 11))
-    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.55, wspace=0.38)
+
+def plot_figure(agg):
+    fig = plt.figure(figsize=(12, 9))
+    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.5, wspace=0.32)
 
     ax1 = fig.add_subplot(gs[0, 0])
     ax2 = fig.add_subplot(gs[0, 1])
     ax3 = fig.add_subplot(gs[1, 0])
     ax4 = fig.add_subplot(gs[1, 1])
-    ax5 = fig.add_subplot(gs[2, :])
+    ax5 = fig.add_subplot(gs[2, 0])
 
     plot_task_panel(ax1, agg['t1'],
                     'Task 1: Audio-Visual', 'a')
@@ -459,7 +587,10 @@ def make_figure(res):
                     # diff_pairs=[('Standard', 'Aud. deviant'),
                     #             ('Standard', 'Novel deviant')],
                     vline_330=True,
-                    legend_loc='lower center')
+                    legend_loc='lower center',
+                    legend_labels={'Standard':      'Standard sound',
+                                   'Aud. deviant':  'Mismatch sound',
+                                   'Novel deviant': 'Novel sound'})
 
     # Resting-state PSD. psd_mean/psd_sem are already in dB — computed
     # per-subject in compute_psd_sub, so the group mean is a geometric mean.
@@ -500,12 +631,9 @@ def make_figure(res):
     ax5.text(-0.03, 1.04, 'e', transform=ax5.transAxes,
              fontsize=12, fontweight='bold', va='bottom', ha='right')
 
-    fig.suptitle('NTAD MEG Dataset – Technical Validation',
-                 fontsize=13, y=1.01)
-
     for fmt in ('png', 'pdf'):
         path = f'{OUT}/technical_validation.{fmt}'
-        fig.savefig(path, dpi=150, bbox_inches='tight')
+        fig.savefig(path, dpi=300, bbox_inches='tight', pad_inches=0.05)
         print(f'Saved → {path}')
     plt.close(fig)
 
@@ -518,15 +646,17 @@ def make_event_table():
     Counts are the programmed number of trials per full session, derived from
     the Presentation experiment files shipped with the dataset.
 
-    STI channel reading for all tasks:
-        mne.find_events(raw, stim_channel='STI101',
-                        mask=4352, mask_type='not_and',
-                        uint_cast=True, shortest_event=1)
-    mask = 256 | 4096 (Oxford site-sync | Cambridge site-sync pulses);
-    mask_type='not_and' passes events that have *neither* sync bit set.
-    uint_cast=True corrects a Neuromag STI016 signed-integer acquisition bug.
+    STI channel reading for all tasks (see _decode_sti):
+        STI101 cast to uint16 (corrects a Neuromag STI016 signed-integer
+        acquisition bug), sync bits masked out (mask = 256 | 4096, Oxford |
+        Cambridge site-sync pulses), then decoded pulse by pulse: a bit is
+        part of the code if it is high for >= 75% of the pulse. This equals
+        mne.find_events(mask=4352, mask_type='not_and', uint_cast=True) on
+        clean recordings and corrects the chattering trigger bit on the
+        Cambridge Triux Neo.
     """
-    READING = "STI101; mask=4352 (256|4096), mask_type='not_and', uint_cast=True"
+    READING = ("STI101; uint16 cast; mask=4352 (256|4096) removed; code = bits "
+               "high for >=75% of each pulse")
 
     # Timing values derived from Presentation experiment files (.sce / .tem).
     # All times in milliseconds.
@@ -654,10 +784,26 @@ if __name__ == '__main__':
     parser.add_argument(
         '--table-only', action='store_true',
         help='Print and save the event table without loading any session data.')
+    parser.add_argument(
+        '--figure-only', action='store_true',
+        help='Redraw the figure from the cached plot-ready data '
+             f'({AGG_PKL}) without touching any per-subject pkl. '
+             'Fastest option for cosmetic-only changes (labels, layout, colours).')
     args = parser.parse_args()
 
     if args.table_only:
         make_event_table()
+        raise SystemExit(0)
+
+    if args.figure_only:
+        if not os.path.exists(AGG_PKL):
+            raise SystemExit(
+                f'{AGG_PKL} not found — run once without --figure-only first.')
+        print(f'  [load]    {AGG_PKL}')
+        with open(AGG_PKL, 'rb') as fh:
+            agg = pickle.load(fh)
+        print('Generating figure…')
+        plot_figure(agg)
         raise SystemExit(0)
 
     specs = _session_specs()
@@ -682,8 +828,12 @@ if __name__ == '__main__':
             res[key], was_computed = load_or_compute(key, label, compute_fn, ow)
             any_new = any_new or was_computed
 
+    agg = compute_agg(res)
+    with open(AGG_PKL, 'wb') as fh:
+        pickle.dump(agg, fh)
+
     print('Generating figure…')
-    make_figure(res)
+    plot_figure(agg)
 
     print('\nEvent table:')
     make_event_table()
